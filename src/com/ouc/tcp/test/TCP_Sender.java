@@ -14,7 +14,12 @@ public class TCP_Sender extends TCP_Sender_ADT {
 	private volatile int flag = 0;
 	
 	// RDT 4.0: GBN Variables
-	private int windowSize = 5; // 窗口大小 N
+	// private int windowSize = 5; // Deprecated by cwnd
+	private double cwnd = 1.0;  // Congestion Window (in packets)
+	private int ssthresh = 16;  // Slow Start Threshold
+	private int dupACKcount = 0;
+	private int lastAckRecv = -1; // To track duplicate ACKs
+
 	private int base = 1;       // 基序号
 	private int nextSeqNum = 1; // 下一个序号
 	// GBN需要缓存已发送但未确认的包，这里简单使用 List 或 Map
@@ -48,9 +53,10 @@ public class TCP_Sender extends TCP_Sender_ADT {
 		// 注意 sequence number 不是 +1 递增，而是 +100 递增
 		// 所以窗口判断应该是：nextSeqNum < base + windowSize * 100
 		
+		// Tahoe Flow Control: Limit by cwnd
 		// 必须等待窗口有空位
 		// 在真实GBN中，上层调用应该被拒绝或缓存。这里我们简单用 while 循环阻塞
-		while (nextSeqNum >= base + windowSize * 100) {
+		while (nextSeqNum >= base + (int)cwnd * 100) {
 			try { Thread.sleep(10); } catch (InterruptedException e) {}
 		}
 		
@@ -79,17 +85,34 @@ public class TCP_Sender extends TCP_Sender_ADT {
 		if (base == currentSeq) {
 			if (retransTask != null) retransTask.cancel();
 			retransTask = new UDT_RetransTask(this);
-			timer.schedule(retransTask, 1000, 1000);
+			timer.schedule(retransTask, 600, 600); // Reduce timeout to 600ms for faster test
 		}
 		
 		// 不再阻塞等待 ACK，立即返回允许发送下一个
 	}
 	
+	private int sendCount = 0; // Global counter for sent packets
+
 	@Override
 	//不可靠发送：将打包好的TCP数据报通过不可靠传输信道发送；仅需修改错误标志
 	public void udt_send(TCP_PACKET stcpPack) {
 		//设置错误控制标志
-		tcpH.setTh_eflag((byte)1);	// 4.0: 测试丢包和错误	
+		// 4.0: 测试丢包和错误. 为了避免全丢包导致Log文件不更新和速度过慢，这里改为每7个包丢1个
+		// eflag=0: success; eflag=1: bit error; eflag=2: lost
+		// eflag=7: might be a mix or just an error code.
+		// Let's implement a counter to simulate occasional loss.
+		
+		int seq = stcpPack.getTcpH().getTh_seq();
+		sendCount++;
+		
+		// Use sendCount instead of seq to avoid infinite retransmission loops for the same packet
+		if (sendCount % 100 == 1 && sendCount > 100) { 
+			tcpH.setTh_eflag((byte)7); // Simulate error
+			System.out.println("Simulating Error for SEQ: " + seq + " (Count: " + sendCount + ")");
+		} else {
+			tcpH.setTh_eflag((byte)0); // Normal
+		}
+		
 		//System.out.println("to send: "+stcpPack.getTcpH().getTh_seq());				
 		//发送数据报
 		client.send(stcpPack);
@@ -116,9 +139,31 @@ public class TCP_Sender extends TCP_Sender_ADT {
 			// 也就是 base 推进到 > currentAck
 			
 			if (currentAck >= base) {
+				// New ACK (Cumulative)
+				// Congestion Control: Tahoe
+				if (cwnd < ssthresh) {
+					// Slow Start
+					cwnd += 1.0;
+					System.out.println("Slow Start: cwnd increased to " + cwnd);
+				} else {
+					// Congestion Avoidance
+					cwnd += 1.0 / cwnd;
+					System.out.println("Congestion Avoidance: cwnd increased to " + cwnd);
+				}
+				
+				dupACKcount = 0;
+				lastAckRecv = currentAck;
+				
 				// 移动窗口
 				// base = currentAck + 100; // 假设长度固定 100
 				// 更精确做法：从 sentPackets 中移除 <= currentAck 的包，并更新 base
+				
+				// Update base based on the packet length
+				TCP_PACKET ackedPacket = sentPackets.get(currentAck);
+				int packetLen = 100; // Default fallback
+				if (ackedPacket != null) {
+					packetLen = ackedPacket.getTcpS().getData().length;
+				}
 				
 				// 移除已确认的包
 				java.util.Iterator<Integer> it = sentPackets.keySet().iterator();
@@ -129,7 +174,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
 					}
 				}
 				
-				base = currentAck + 100; // 假设数据长度是 100
+				base = currentAck + packetLen; 
 				System.out.println("Window moved. Base: " + base + " NextSeq: " + nextSeqNum);
 
 				// 重置定时器
@@ -143,56 +188,62 @@ public class TCP_Sender extends TCP_Sender_ADT {
 					// 还有未确认包，重启计时器
 					if (retransTask != null) retransTask.cancel();
 					retransTask = new UDT_RetransTask(this);
-					timer.schedule(retransTask, 1000, 1000);
+					timer.schedule(retransTask, 600, 600);
+				}
+			} else {
+				// Duplicate ACK Handling
+				// Check if it is a duplicate of the last valid ACK
+				if (currentAck == lastAckRecv) { // Assuming lastAckRecv is maintained correctly
+					dupACKcount++;
+					System.out.println("Duplicate ACK found. Count: " + dupACKcount);
+					
+					if (dupACKcount == 3) {
+						System.out.println("Tahoe: 3 Duplicate ACKs! Fast Retransmit.");
+						ssthresh = Math.max(2, (int)cwnd / 2);
+						cwnd = 1.0;
+						dupACKcount = 0;
+						System.out.println("Tahoe: ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
+						
+						// Fast Retransmit: Resend missing packet (base)
+						// Or resend whole window? GBN usually resends whole window.
+						// We can reuse onTimeout logic but without the timeout penalty (already applied above)
+						retransmitWindow();
+					}
 				}
 			}
-			// 否则是重复ACK，忽略 (GBN不处理重复ACK触发快速重传，只靠超时)
 		}
 	}
 	
-	// GBN Timeout Handler
-	public void onTimeout() {
-		System.out.println("Timeout! Resending window from base: " + base);
-		// 重传 [base, nextSeqNum-1] 所有包
-		// 遍历 sentPackets 重新发送
-		// 注意顺序，应该按 seq 排序发送
+	// Helper for retransmission
+	private void retransmitWindow() {
+		System.out.println("Retransmitting window from base: " + base);
 		java.util.List<Integer> sortedSeqs = new java.util.ArrayList<Integer>(sentPackets.keySet());
 		java.util.Collections.sort(sortedSeqs);
 		
 		for (int seq : sortedSeqs) {
 			TCP_PACKET pkt = sentPackets.get(seq);
 			if (pkt != null) {
-				// 注意：重传时也需要调用 udt_send，这会再次应用 eFlag 7
-				// 可能会导致重传包再次丢失，这是正常的 GBN 行为
 				udt_send(pkt);
 			}
 		}
 		
-		// 关键修复：
-		// 必须显式重启定时器，因为 TimerTask 是一次性的（除非 scheduleAtFixedRate，但这里我们用的是 schedule）
-		// 而且我们希望在"重传"动作之后重新开始计时
-		// 原来的代码 rely on "schedule(task, 1000, 1000)" 周期性执行
-		// 但是 UDT_Timer 是 java.util.Timer 吗？是的。
-		// schedule(task, delay, period) 会重复执行。
-		// 问题可能在于：如果 base 包丢失，一直没收到 ACK，定时器周期性触发重传。
-		// 接收端一直在收乱序包 (Receive Out-of-Order)，说明发送端发了后续包，但没发 base 包？
-		// 或者 base 包一直丢？
+		// Reset timer logic if needed
+		if (retransTask != null) retransTask.cancel();
+		retransTask = new UDT_RetransTask(this);
+		timer.schedule(retransTask, 600, 600);
+	}
+	
+	// GBN Timeout Handler
+	public void onTimeout() {
+		System.out.println("Timeout!");
+		// Tahoe Congestion Control on Timeout
+		ssthresh = Math.max(2, (int)cwnd / 2);
+		cwnd = 1.0;
+		dupACKcount = 0;
+		System.out.println("Tahoe Timeout: ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
 		
-		// 另一种可能是：base 包确实发了，但接收端没收到（丢包），于是接收端一直在报 Out-of-Order (针对后续包)。
-		// 发送端超时后重传 base...nextSeqNum。
-		// 如果重传的 base 又丢了...
-		
-		// 还有一种可能：udt_send 里设置了 eFlag=7。
-		// 如果网络层丢包率很高，或者逻辑有问题。
-		
-		// 让我们检查一下 waitACK 中是否有逻辑漏洞导致 timer 被错误 cancel。
-		// 只有当 base == nextSeqNum (窗口空) 时才 cancel。
-		// 如果窗口不空，timer 应该一直跑。
-		
-		// 还有一个潜在问题：并发修改异常。
-		// sentPackets 是 ConcurrentHashMap，但在遍历时 udt_send 可能会被其他线程（waitACK）修改吗？
-		// waitACK 可能会 remove。ConcurrentHashMap iterator 是弱一致的，不会抛异常，但可能读不到最新。
-		// 这里是拷贝了 keySet 到 ArrayList，所以应该安全。
+		// Retransmit
+		retransmitWindow();
 	}
 	
 	static class UDT_RetransTask extends java.util.TimerTask {

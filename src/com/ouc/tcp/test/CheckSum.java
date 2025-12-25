@@ -11,7 +11,20 @@ public class CheckSum {
 	public static short computeChkSum(TCP_PACKET tcpPack) {
 		int checkSum = 0;
 		
+		TCP_HEADER tcpH = tcpPack.getTcpH();
+		// Sum seq, ack, and data
+		checkSum += tcpH.getTh_seq();
+		checkSum += tcpH.getTh_ack();
 		
+		int[] data = tcpPack.getTcpS().getData();
+		if (data != null) {
+			for (int i = 0; i < data.length; i++) {
+				checkSum += data[i];
+				// Handling overflow if necessary, but using CRC32 is better. 
+				// However, to keep it simple and consistent with potential framework expectations:
+				checkSum = (checkSum % 65535); // Simple wrap around
+			}
+		}
 		
 		return (short) checkSum;
 	}
