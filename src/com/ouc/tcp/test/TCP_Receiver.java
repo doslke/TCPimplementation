@@ -32,9 +32,21 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 			
 			int recvSeq = recvPack.getTcpH().getTh_seq();
 			
-			// 2. 检查序号是否符合期待 (解决重复包问题)
+			// 4.0 GBN: 接收端逻辑
+			// GBN接收端很简单：只接收符合 expectSequence 的包，否则丢弃（或重发上一个ACK）
+			// 实际上 2.2 的接收端逻辑对于 GBN 也是适用的 (累积确认)
+			
 			if (recvSeq == expectSequence) {
+				// 收到期待的包
+				
+				// 计算下一个期待的seq
+				int dataLen = recvPack.getTcpS().getData().length;
+				int nextExpect = expectSequence + dataLen;
+				
 				// 生成ACK报文段（设置确认号）
+				// 注意：在GBN中，ack通常是"下一个期待的"，或者"已收到的最后一个"
+				// 这里我们使用 "已收到的最后一个" (recvSeq)
+				// 发送端会检查 ack >= base
 				tcpH.setTh_ack(recvSeq);
 				ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
 				tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
@@ -44,57 +56,33 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 				
 				// 更新状态
 				lastAck = recvSeq;
-				// 假设数据载荷长度固定或可计算，更新期待的下一序号
-				// 这里简单通过数据长度累加。注意：Sender中是 index * length + 1
-				// 所以这里的 expectSequence 应该增加数据长度
-				// 如果数据是 int[]，长度是 length * 4 bytes? 还是仅仅指个数？
-				// 根据Sender: tcpH.setTh_seq(dataIndex * appData.length + 1);
-				// 序列号是按 int 个数增加的 (假设 appData.length 是数组长度)
-				int dataLen = recvPack.getTcpS().getData().length;
-				expectSequence += dataLen;
+				expectSequence = nextExpect;
 
 				// 将接收到的正确有序的数据插入data队列，准备交付
 				dataQueue.add(recvPack.getTcpS().getData());				
-				// sequence++; // 不再使用简单的sequence++
 				
-				System.out.println("Receive SEQ: " + recvSeq + " (OK). Expected: " + (expectSequence - dataLen));
+				System.out.println("Receive SEQ: " + recvSeq + " (OK). Next Expected: " + expectSequence);
 				
-			} else if (recvSeq < expectSequence) {
-				// 收到重复包 (可能是ACK丢失导致Sender重传)
-				// 必须重传对应的ACK
-				System.out.println("Receive Duplicate SEQ: " + recvSeq + ". Expected: " + expectSequence);
-				
-				tcpH.setTh_ack(recvSeq);
-				ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-				tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-				reply(ackPack);
 			} else {
-				// 乱序包 (大于 expect)，在 Stop-and-Wait 不应出现，除非严重丢包
-				System.out.println("Receive Out-of-Order SEQ: " + recvSeq + ". Expected: " + expectSequence);
-				// 可以选择不回应，或者重发 lastAck
+				// 乱序包或重复包：丢弃，重发上一个正确ACK (lastAck)
+				System.out.println("Receive Unexpected SEQ: " + recvSeq + ". Expected: " + expectSequence);
+				
+				if (lastAck != -1) {
+					tcpH.setTh_ack(lastAck);
+					ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
+					tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
+					reply(ackPack);
+				}
+				// 如果是第一个包就错了(lastAck==-1)，不回应，让Sender超时重传
 			}
 			
 		}else{
 			// 校验和错误
 			System.out.println("Recieve CheckSum Error. Seq: " + recvPack.getTcpH().getTh_seq());
 			
-			// 2.2: 不发送NACK，而是重发上一次正确的ACK (Duplicate ACK)
+			// GBN: 出错包直接丢弃，重发上一个正确ACK
 			if (lastAck != -1) {
 				tcpH.setTh_ack(lastAck);
-				ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
-				tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
-				reply(ackPack);
-			}
-			// 如果是第一个包就错了(lastAck==-1)，什么都不做，或者发送特定的初始ACK?
-			// 这里选择什么都不做，因为没有Timer，Sender会死锁吗？
-			// 不，Sender没有Timer，Sender也在死等ACK。
-			// 如果Receiver不回ACK，Sender会一直卡在 waitACK 循环里。
-			// 所以如果不回ACK，整个系统会挂起。
-			// 为了防止死锁（因为没有Timer），我们还是得回点什么，让Sender知道不对。
-			// 但Sender逻辑是: if (ack == currentSeq) OK else Retransmit.
-			// 所以回 lastAck (-1) 也会触发重传。
-			else {
-				tcpH.setTh_ack(-1); // 特殊情况：第一个包就错，回-1触发重传
 				ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
 				tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));
 				reply(ackPack);
@@ -141,7 +129,7 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 	//回复ACK报文段
 	public void reply(TCP_PACKET replyPack) {
 		//设置错误控制标志
-		tcpH.setTh_eflag((byte)1);	//eFlag=0，信道无错误
+		tcpH.setTh_eflag((byte)1);	//eFlag=1，信道无错误 (确保ACK能顺利返回，主要测试发送端的重传)
 				
 		//发送数据报
 		client.send(replyPack);
