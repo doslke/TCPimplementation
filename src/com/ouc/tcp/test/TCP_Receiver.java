@@ -27,6 +27,12 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 	@Override
 	//接收到数据报：检查校验和，设置回复的ACK报文段
 	public void rdt_recv(TCP_PACKET recvPack) {
+		// 0. 检查是否为模拟丢包 (eflag == 2)
+		if (recvPack.getTcpH().getTh_eflag() == (byte)2) {
+			System.out.println("!!! SIMULATED PACKET LOSS: Seq " + recvPack.getTcpH().getTh_seq() + " !!!");
+			return; // 模拟丢包，直接丢弃，不回复ACK
+		}
+
 		// 1. 检查校验码
 		if(CheckSum.computeChkSum(recvPack) == recvPack.getTcpH().getTh_sum()) {
 			
@@ -65,9 +71,11 @@ public class TCP_Receiver extends TCP_Receiver_ADT {
 				
 			} else {
 				// 乱序包或重复包：丢弃，重发上一个正确ACK (lastAck)
-				System.out.println("Receive Unexpected SEQ: " + recvSeq + ". Expected: " + expectSequence);
+				// System.out.println("Receive Unexpected SEQ: " + recvSeq + ". Expected: " + expectSequence);
 				
 				if (lastAck != -1) {
+					System.out.println("[Duplicated ACK] Receive Unexpected SEQ: " + recvSeq + 
+									   ". Expected: " + expectSequence + ". Resending ACK: " + lastAck);
 					tcpH.setTh_ack(lastAck);
 					ackPack = new TCP_PACKET(tcpH, tcpS, recvPack.getSourceAddr());
 					tcpH.setTh_sum(CheckSum.computeChkSum(ackPack));

@@ -11,24 +11,22 @@ import com.ouc.tcp.tool.TCP_TOOL;
 public class TCP_Sender extends TCP_Sender_ADT {
 	
 	private TCP_PACKET tcpPack;	//待发送的TCP数据报
-	private volatile int flag = 0;
 	
 	// Configuration: Set to true for Reno, false for Tahoe
-	public static final boolean IS_RENO = false; 
+    public static final boolean IS_RENO = true; 
 	
 	// RDT 4.0: GBN Variables
-	// private int windowSize = 5; // Deprecated by cwnd
 	private double cwnd = 1.0;  // Congestion Window (in packets)
 	private int ssthresh = 16;  // Slow Start Threshold
 	private int dupACKcount = 0;
 	private int lastAckRecv = -1; // To track duplicate ACKs
-	private boolean isFastRecovery = false; // Reno State
+    private boolean isFastRecovery = false; // Reno State
+    private boolean lossInjected = false;
 
 	private int base = 1;       // 基序号
 	private int nextSeqNum = 1; // 下一个序号
 	// GBN需要缓存已发送但未确认的包，这里简单使用 List 或 Map
 	// 由于序号是 index * length + 1，不是连续整数，用 Map 更方便
-	// 或者直接缓存 TCP_PACKET
 	private java.util.concurrent.ConcurrentHashMap<Integer, TCP_PACKET> sentPackets = new java.util.concurrent.ConcurrentHashMap<Integer, TCP_PACKET>();
 	private UDT_Timer timer;
 	private UDT_RetransTask retransTask;
@@ -84,19 +82,31 @@ public class TCP_Sender extends TCP_Sender_ADT {
 		}
 		
 		//生成TCP数据报（设置序号和数据字段/校验和),注意打包的顺序
-		tcpH.setTh_seq(currentSeq);
-		tcpS.setData(appData);
-		tcpPack = new TCP_PACKET(tcpH, tcpS, destinAddr);		
+		// Use clone() to copy all fields including flags
+		TCP_HEADER newTcpH = null;
+		try {
+			newTcpH = (TCP_HEADER) tcpH.clone();
+		} catch (CloneNotSupportedException e) {
+			e.printStackTrace();
+		}
+		
+		newTcpH.setTh_seq(currentSeq);
+		newTcpH.setTh_doff(tcpH.getTh_doff()); 
+		// sum is calculated later
+
+		TCP_SEGMENT newTcpS = new TCP_SEGMENT();
+		newTcpS.setData(appData);
+
+		tcpPack = new TCP_PACKET(newTcpH, newTcpS, destinAddr);		
 				
-		tcpH.setTh_sum(CheckSum.computeChkSum(tcpPack));
-		tcpPack.setTcpH(tcpH);
+		newTcpH.setTh_sum(CheckSum.computeChkSum(tcpPack));
+		tcpPack.setTcpH(newTcpH);
 		
 		// 缓存包
 		sentPackets.put(currentSeq, tcpPack);
 		
 		//发送TCP数据报
 		udt_send(tcpPack);
-		// flag = 0; // GBN不再使用简单的 flag 阻塞
 		
 		// 更新 nextSeqNum
 		// 注意：这里的 nextSeqNum 应该等于 currentSeq + dataLen
@@ -114,31 +124,18 @@ public class TCP_Sender extends TCP_Sender_ADT {
 		// 不再阻塞等待 ACK，立即返回允许发送下一个
 	}
 	
-	private int sendCount = 0; // Global counter for sent packets
-
 	@Override
 	//不可靠发送：将打包好的TCP数据报通过不可靠传输信道发送；仅需修改错误标志
-	public void udt_send(TCP_PACKET stcpPack) {
-		//设置错误控制标志
-		// 4.0: 测试丢包和错误. 为了避免全丢包导致Log文件不更新和速度过慢，这里改为每7个包丢1个
-		// eflag=0: success; eflag=1: bit error; eflag=2: lost
-		// eflag=7: might be a mix or just an error code.
-		// Let's implement a counter to simulate occasional loss.
-		
-		int seq = stcpPack.getTcpH().getTh_seq();
-		sendCount++;
-		
-		// Use sendCount instead of seq to avoid infinite retransmission loops for the same packet
-		if (sendCount % 100 == 1 && sendCount > 100) { 
-			tcpH.setTh_eflag((byte)7); // Simulate error
-			System.out.println("Simulating Error for SEQ: " + seq + " (Count: " + sendCount + ")");
-		} else {
-			tcpH.setTh_eflag((byte)0); // Normal
-		}
-		
-		//System.out.println("to send: "+stcpPack.getTcpH().getTh_seq());				
-		//发送数据报
-		client.send(stcpPack);
+    public void udt_send(TCP_PACKET stcpPack) {
+        int seq = stcpPack.getTcpH().getTh_seq();
+        
+        if (!lossInjected && seq == 701) {
+             lossInjected = true;
+             // Simulate loss by NOT sending the packet
+             return;
+        }
+        
+        client.send(stcpPack);
 	}
 	
 	@Override
@@ -169,19 +166,19 @@ public class TCP_Sender extends TCP_Sender_ADT {
 					cwnd = ssthresh;
 					isFastRecovery = false;
 					dupACKcount = 0;
-					System.out.println("Reno: New ACK in Fast Recovery. Exiting. cwnd -> " + cwnd);
+					System.out.println("[Reno] Fast Recovery -> Congestion Avoidance (New ACK). cwnd set to ssthresh: " + cwnd);
 					logCwnd("RenoExitFastRecovery");
 				} else {
 					// Tahoe/Reno Normal Mode
 					if (cwnd < ssthresh) {
 						// Slow Start
 						cwnd += 1.0;
-						System.out.println("Slow Start: cwnd increased to " + cwnd);
+						System.out.println("[Slow Start] cwnd increased to " + cwnd);
 						logCwnd("SlowStart");
 					} else {
 						// Congestion Avoidance
 						cwnd += 1.0 / cwnd;
-						System.out.println("Congestion Avoidance: cwnd increased to " + cwnd);
+						System.out.println("[Congestion Avoidance] cwnd increased to " + cwnd);
 						logCwnd("CongestionAvoidance");
 					}
 					dupACKcount = 0;
@@ -226,38 +223,44 @@ public class TCP_Sender extends TCP_Sender_ADT {
 			} else {
 				// Duplicate ACK Handling
 				// Check if it is a duplicate of the last valid ACK
-				if (currentAck == lastAckRecv) { // Assuming lastAckRecv is maintained correctly
-					dupACKcount++;
-					System.out.println("Duplicate ACK found. Count: " + dupACKcount);
-					
-					if (dupACKcount == 3) {
-						if (IS_RENO) {
-							// Reno: Fast Retransmit & Enter Fast Recovery
-							System.out.println("Reno: 3 Duplicate ACKs! Fast Retransmit.");
-							ssthresh = Math.max(2, (int)cwnd / 2);
-							cwnd = ssthresh + 3;
-							isFastRecovery = true;
-							System.out.println("Reno: Entering Fast Recovery. ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
-							logCwnd("RenoFastRetransmit");
-						} else {
-							// Tahoe: Fast Retransmit
-							System.out.println("Tahoe: 3 Duplicate ACKs! Fast Retransmit.");
-							ssthresh = Math.max(2, (int)cwnd / 2);
-							cwnd = 1.0;
-							dupACKcount = 0; // Reset dupACKs in Tahoe
-							System.out.println("Tahoe: ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
-							logCwnd("TahoeFastRetransmit");
-						}
-						
-						// Fast Retransmit: Resend missing packet (base)
-						retransmitWindow();
-					} else if (IS_RENO && dupACKcount > 3) {
-						// Reno: Fast Recovery: Inflate Window
-						cwnd += 1.0;
-						System.out.println("Reno: Fast Recovery. Inflating cwnd to " + cwnd);
-						logCwnd("RenoWindowInflation");
-					}
-				}
+                if (currentAck == lastAckRecv) {
+                    dupACKcount++;
+                    System.out.println("Duplicate ACK found. Count: " + dupACKcount);
+                    
+                    if (dupACKcount == 3) {
+                        if (IS_RENO) {
+                            // Reno: Fast Retransmit & Enter Fast Recovery
+                            System.out.println("[Reno] 3 Duplicate ACKs! -> Fast Retransmit");
+                            ssthresh = Math.max(2, (int)cwnd / 2);
+                            cwnd = ssthresh + 3;
+                            isFastRecovery = true;
+                            System.out.println("[Reno] Entering Fast Recovery. ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
+                            logCwnd("RenoFastRetransmit");
+                            TCP_PACKET missing = sentPackets.get(base);
+                            if (missing != null) {
+                                System.out.println("[Reno] Retransmitting packet SEQ: " + base);
+                                udt_send(missing);
+                            } else {
+                                System.out.println("[Reno] ERROR: Missing packet not found in buffer! Base: " + base);
+                            }
+                        } else {
+                            // Tahoe: Fast Retransmit
+                            System.out.println("[Tahoe] 3 Duplicate ACKs! -> Fast Retransmit");
+                            ssthresh = Math.max(2, (int)cwnd / 2);
+                            cwnd = 1.0;
+                            dupACKcount = 0; // Reset dupACKs in Tahoe
+                            System.out.println("[Tahoe] Entering Slow Start. ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
+                            logCwnd("TahoeFastRetransmit");
+                        }
+                        
+                        
+                    } else if (IS_RENO && dupACKcount > 3) {
+                        // Reno: Fast Recovery: Inflate Window
+                        cwnd += 1.0;
+                        System.out.println("[Reno] Fast Recovery (DupACK). Inflating cwnd to " + cwnd);
+                        logCwnd("RenoWindowInflation");
+                    }
+                }
 			}
 		}
 	}
@@ -289,7 +292,7 @@ public class TCP_Sender extends TCP_Sender_ADT {
 		cwnd = 1.0;
 		dupACKcount = 0;
 		isFastRecovery = false; // Reset State
-		System.out.println("Timeout: ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
+		System.out.println("[Timeout] -> Slow Start. ssthresh -> " + ssthresh + ", cwnd -> " + cwnd);
 		logCwnd("Timeout");
 		
 		// Retransmit
